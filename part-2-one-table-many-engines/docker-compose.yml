@@ -1,0 +1,250 @@
+# One table, many engines: a single Gravitino Iceberg REST Catalog (dynamic mode),
+# with Spark, Flink, Trino, and DuckDB all reading and writing the same table.
+#
+# "Dynamic mode" means the catalog is created at runtime through Gravitino's own
+# management API (see scripts/create-catalog.sh), and the embedded Iceberg REST
+# service looks up that catalog's config on every request. There's no static
+# catalog config file to hand-edit per engine.
+#
+# Host ports:
+#   9000 MinIO S3 API        9090 MinIO console
+#   8090 Gravitino API       9002 Iceberg REST (embedded/aux service)
+#   8080 Flink UI            8081 Trino
+#   5432 Postgres
+#
+# `docker compose up -d` alone brings up everything needed to start creating the
+# catalog: it fetches and checksum-verifies the engine jars (jars-init) and
+# prepares Gravitino's own metadata schema (schema-init) automatically. Creating
+# the catalog itself is deliberately NOT automated — that's the two curls in the
+# README's Quickstart section, and seeing them run is the point of this demo.
+
+name: iceberg-in-practice
+
+x-s3-env: &s3-env
+  AWS_ACCESS_KEY_ID: minioadmin
+  AWS_SECRET_ACCESS_KEY: minioadmin
+  AWS_REGION: us-east-1
+
+services:
+
+  # ---------- storage ----------
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9090"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9090:9090"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    volumes:
+      - minio-data:/data
+
+  # Creates the lakehouse bucket, then exits.
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadmin &&
+      mc mb --ignore-existing local/lakehouse &&
+      mc ls local &&
+      echo 'bucket ready'
+      "
+
+  # ---------- catalog backend ----------
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: iceberg
+      POSTGRES_PASSWORD: iceberg
+      POSTGRES_DB: iceberg
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U iceberg -d iceberg"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+
+  # Gravitino's full server has no auto-migration for its own metadata store (that's
+  # different from the Iceberg catalog's `jdbc-initialize`, which DOES auto-create
+  # its own tables on first use). This one-shot service creates the two databases
+  # the stack needs and loads Gravitino's own entity-store schema before
+  # catalog-dynamic ever starts. See README.md's "Gotchas" section for why this
+  # step exists and what breaks without it.
+  schema-init:
+    image: postgres:16
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./conf/gravitino-meta-schema-1.3.0-postgresql.sql:/schema.sql:ro
+    environment:
+      PGPASSWORD: iceberg
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -euo pipefail
+        psql -h postgres -U iceberg -d iceberg -tc \
+          "SELECT 1 FROM pg_database WHERE datname = 'gravitino_meta'" | grep -q 1 \
+          || psql -h postgres -U iceberg -d iceberg -c "CREATE DATABASE gravitino_meta"
+        psql -h postgres -U iceberg -d iceberg -tc \
+          "SELECT 1 FROM pg_database WHERE datname = 'iceberg_dynamic'" | grep -q 1 \
+          || psql -h postgres -U iceberg -d iceberg -c "CREATE DATABASE iceberg_dynamic"
+        psql -h postgres -U iceberg -d gravitino_meta -f /schema.sql
+        echo "schema-init complete"
+
+  # Fetches the pinned Spark/Flink/Hadoop/Iceberg jars and the DuckDB CLI, verifying
+  # SHA-256 before anything is put in place. See scripts/fetch-jars.py for the full
+  # manifest; nothing here is fetched from an unpinned "latest" tag.
+  jars-init:
+    image: python:3.12-alpine
+    volumes:
+      - ./scripts/fetch-jars.py:/fetch-jars.py:ro
+      - jars-spark:/out/spark
+      - jars-flink:/out/flink
+      - jars-duckdb:/out/duckdb
+    command: ["python3", "/fetch-jars.py"]
+
+  # Full Gravitino server (not the IRC-only image) with the Iceberg REST service
+  # enabled as an auxiliary/embedded service and the dynamic catalog-config
+  # provider: catalogs are created via POST to the management API (port 8090) and
+  # the embedded IRC (port 9001 in-container, published as 9002) reads each
+  # catalog's config from Gravitino's own registry on every request.
+  catalog-dynamic:
+    image: apache/gravitino:1.3.0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      schema-init:
+        condition: service_completed_successfully
+    ports:
+      - "8090:8090"   # Gravitino management API -- this is where the two
+                       # catalog-creation POSTs in the Quickstart go.
+      - "9002:9001"    # embedded Iceberg REST; container port is still 9001.
+    environment:
+      # The image's entrypoint rewrites conf/gravitino.conf from env vars on every
+      # boot, os.remove()-ing the file first -- which can't work on a bind mount.
+      # This undocumented flag turns that rewrite off.
+      SKIP_CONFIG_REWRITE: "true"
+    volumes:
+      - ./conf/gravitino.conf:/opt/gravitino/conf/gravitino.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8090/api/version || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  # ---------- engines ----------
+  # Engines idle on `sleep infinity`; each SQL script is driven with
+  # `docker compose exec` so its output can be inspected directly.
+
+  spark:
+    image: spark:3.5.8-java17-python3
+    depends_on:
+      catalog-dynamic:
+        condition: service_healthy
+      jars-init:
+        condition: service_completed_successfully
+    environment: *s3-env
+    user: root
+    volumes:
+      - jars-spark:/opt/spark/jars/extra:ro
+      - ./sql:/sql:ro
+      - ./scripts:/scripts:ro
+    entrypoint: ["/bin/bash", "-c", "sleep infinity"]
+
+  flink-jobmanager:
+    image: flink:1.20.5-scala_2.12-java17
+    depends_on:
+      catalog-dynamic:
+        condition: service_healthy
+      jars-init:
+        condition: service_completed_successfully
+    ports:
+      - "8080:8081"
+    environment:
+      <<: *s3-env
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        rest.flamegraph.enabled: true
+        execution.checkpointing.interval: 10s
+    volumes:
+      # Flink's classpath builder recurses into any subdirectory under lib/ (no
+      # -maxdepth in its `find`), so a subdirectory mount is picked up exactly
+      # like a flat one -- no need to mount each jar individually.
+      - jars-flink:/opt/flink/lib/iceberg-extra:ro
+      - ./sql:/sql:ro
+      - ./scripts:/scripts:ro
+    command: jobmanager
+
+  flink-taskmanager:
+    image: flink:1.20.5-scala_2.12-java17
+    depends_on:
+      - flink-jobmanager
+    environment:
+      <<: *s3-env
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        taskmanager.memory.process.size: 2048m
+    volumes:
+      - jars-flink:/opt/flink/lib/iceberg-extra:ro
+    command: taskmanager
+
+  trino:
+    image: trinodb/trino:483
+    depends_on:
+      catalog-dynamic:
+        condition: service_healthy
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./conf/trino/catalog:/etc/trino/catalog:ro
+      - ./sql:/sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/v1/info | grep -q '\"starting\":false'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  # DuckDB runs on the compose network, not the host: table metadata resolves
+  # s3://lakehouse/... via minio:9000, so a host-side DuckDB would need a
+  # different endpoint than every other engine.
+  duckdb:
+    image: debian:bookworm-slim
+    depends_on:
+      catalog-dynamic:
+        condition: service_healthy
+      jars-init:
+        condition: service_completed_successfully
+    environment: *s3-env
+    volumes:
+      - jars-duckdb:/opt/duckdb:ro
+      - ./sql:/sql:ro
+      - ./scripts:/scripts:ro
+      - duckdb-ext:/root/.duckdb
+    entrypoint: ["/bin/bash", "-c", "sleep infinity"]
+
+volumes:
+  minio-data:
+  pg-data:
+  duckdb-ext:
+  jars-spark:
+  jars-flink:
+  jars-duckdb:
