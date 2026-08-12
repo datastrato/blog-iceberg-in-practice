@@ -2,9 +2,10 @@
 # Creates a namespace and a table through the raw Iceberg REST Catalog API --
 # the same protocol every engine in part 2 speaks, just called directly.
 #
-# Uses its own "tour" namespace, separate from part 2's "demo" namespace, so
-# running this tour can never change part 2's expected row counts or snapshot
-# chain, no matter what order you run things in or how many times you rerun it.
+# Uses its own "tour" namespace against this part's own catalog -- entirely
+# separate from part 2's stack and its "demo" namespace, so running this tour
+# can never change part 2's expected row counts or snapshot chain, no matter
+# what order you run things in or how many times you rerun it.
 #
 # Safe to rerun: drops the tour table/namespace first if they're already there.
 set -euo pipefail

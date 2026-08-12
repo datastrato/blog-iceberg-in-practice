@@ -1,0 +1,177 @@
+# Part 1: a curl-level tour of the Iceberg REST Catalog API. Independent of part 2
+# -- this brings up its own Gravitino (dynamic mode) + Postgres + MinIO, so the
+# whole tour runs from a fresh clone of just this directory.
+#
+# Four of the five steps in the tour are pure curl. The third (the metadata-pointer
+# swap) needs to make an actual Iceberg commit, and a commit means writing a real
+# data file and a new manifest before the one atomic REST update call -- that's a
+# client-library operation, not something curl can do without hand-building
+# Iceberg's file formats. That one step uses PyIceberg (a REST-catalog Python
+# client, not a query engine) as a one-shot container; every curl call around it,
+# before and after each commit, is what actually demonstrates metadata-location
+# swapping. See scripts/02-metadata-pointer-swap.sh and README.md's "The tour".
+#
+# Host ports -- same as part 2's, on purpose (identical stacks, just independent):
+#   9000 MinIO S3 API   9090 MinIO console
+#   8090 Gravitino API  9002 Iceberg REST (embedded/aux service)
+#   5432 Postgres
+# Bring one part's stack down (`docker compose down`) before starting the other's.
+#
+# `docker compose up -d` brings up everything needed to start creating the catalog:
+# it prepares Gravitino's own metadata schema (schema-init) and installs the
+# SHA-pinned PyIceberg client (pyiceberg-init) automatically. Creating the catalog
+# itself is deliberately NOT automated -- see README.md's Quickstart.
+
+name: iceberg-in-practice-part1
+
+services:
+
+  # ---------- storage ----------
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9090"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9090:9090"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    volumes:
+      - minio-data:/data
+
+  # Creates the lakehouse bucket, then exits.
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadmin &&
+      mc mb --ignore-existing local/lakehouse &&
+      mc ls local &&
+      echo 'bucket ready'
+      "
+
+  # ---------- catalog backend ----------
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: iceberg
+      POSTGRES_PASSWORD: iceberg
+      POSTGRES_DB: iceberg
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U iceberg -d iceberg"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+
+  # Gravitino's full server has no auto-migration for its own metadata store (that's
+  # different from the Iceberg catalog's `jdbc-initialize`, which DOES auto-create
+  # its own tables on first use). This one-shot service creates the two databases
+  # the stack needs and loads Gravitino's own entity-store schema before
+  # catalog-dynamic ever starts. See README.md's "Gotchas" section for why this
+  # step exists and what breaks without it.
+  schema-init:
+    image: postgres:16
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./conf/gravitino-meta-schema-1.3.0-postgresql.sql:/schema.sql:ro
+    environment:
+      PGPASSWORD: iceberg
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -euo pipefail
+        psql -h postgres -U iceberg -d iceberg -tc \
+          "SELECT 1 FROM pg_database WHERE datname = 'gravitino_meta'" | grep -q 1 \
+          || psql -h postgres -U iceberg -d iceberg -c "CREATE DATABASE gravitino_meta"
+        psql -h postgres -U iceberg -d iceberg -tc \
+          "SELECT 1 FROM pg_database WHERE datname = 'iceberg_dynamic'" | grep -q 1 \
+          || psql -h postgres -U iceberg -d iceberg -c "CREATE DATABASE iceberg_dynamic"
+        psql -h postgres -U iceberg -d gravitino_meta -f /schema.sql
+        echo "schema-init complete"
+
+  # Fetches and SHA-256-verifies the pinned PyIceberg client (+ its dependency
+  # tree) via pip, into a volume the `pyiceberg` service mounts read-only. Same
+  # verify-or-fail convention as part 2's jars-init, applied to pip instead of
+  # Maven. See requirements/pyiceberg.txt for the pinned versions and hashes.
+  pyiceberg-init:
+    image: python:3.12-slim
+    volumes:
+      - ./requirements/pyiceberg.txt:/requirements.txt:ro
+      - pyiceberg-site-packages:/out
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -euo pipefail
+        pip install --root-user-action=ignore --require-hashes --target=/out -r /requirements.txt
+        echo "pyiceberg-init complete: $$(ls /out | wc -l) entries installed to /out"
+
+  # Full Gravitino server (not the IRC-only image) with the Iceberg REST service
+  # enabled as an auxiliary/embedded service and the dynamic catalog-config
+  # provider: the catalog is created via POST to the management API (port 8090)
+  # and the embedded IRC (port 9001 in-container, published as 9002) reads its
+  # config from Gravitino's own registry on every request.
+  catalog-dynamic:
+    image: apache/gravitino:1.3.0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      schema-init:
+        condition: service_completed_successfully
+    ports:
+      - "8090:8090"   # Gravitino management API -- this is where the two
+                       # catalog-creation POSTs in the Quickstart go.
+      - "9002:9001"    # embedded Iceberg REST; container port is still 9001.
+    environment:
+      # The image's entrypoint rewrites conf/gravitino.conf from env vars on every
+      # boot, os.remove()-ing the file first -- which can't work on a bind mount.
+      # This undocumented flag turns that rewrite off.
+      SKIP_CONFIG_REWRITE: "true"
+    volumes:
+      - ./conf/gravitino.conf:/opt/gravitino/conf/gravitino.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8090/api/version || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  # ---------- REST client (not an engine) ----------
+  # Idles on `sleep infinity`; scripts/02-metadata-pointer-swap.sh drives it with
+  # `docker compose exec` to run scripts/commit-event.py -- the one step in the
+  # tour that isn't plain curl. No S3 credentials configured here: the catalog was
+  # created with credential-providers=s3-token, so PyIceberg fetches short-lived,
+  # table-scoped credentials from the catalog itself at write time.
+  pyiceberg:
+    image: python:3.12-slim
+    depends_on:
+      catalog-dynamic:
+        condition: service_healthy
+      pyiceberg-init:
+        condition: service_completed_successfully
+    environment:
+      PYTHONPATH: /opt/pyiceberg-site-packages
+    volumes:
+      - pyiceberg-site-packages:/opt/pyiceberg-site-packages:ro
+      - ./scripts:/scripts:ro
+    entrypoint: ["/bin/bash", "-c", "sleep infinity"]
+
+volumes:
+  minio-data:
+  pg-data:
+  pyiceberg-site-packages:

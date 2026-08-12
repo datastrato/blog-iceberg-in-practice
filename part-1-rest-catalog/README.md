@@ -6,24 +6,51 @@ vending. This directory is the hands-on companion: the same mechanics, called
 directly with curl, so you can see the actual requests and responses instead of
 taking the post's word for it.
 
-> **This is a demo rig, not a reference deployment.** See part 2's README for
-> the full disclaimer — everything here runs against that same demo stack.
+> **This is a demo rig, not a reference deployment.** Single-node MinIO, a
+> shared Postgres instance, no auth, no TLS, no HA — built to make the REST
+> Catalog's behavior visible, not to model a production topology. This part is
+> fully independent of part 2: its own Gravitino, Postgres, and MinIO, brought
+> up from this directory alone. The two parts use the **same host ports**
+> (see below), so bring one stack down (`docker compose down`) before starting
+> the other.
 
 ## Prerequisites
 
-This tour makes no infrastructure of its own — it runs entirely against the
-stack from **part 2**. Before running anything here:
+- Docker with Compose v2 (`docker compose version`)
 
-1. Start the part-2 stack: `cd ../part-2-one-table-many-engines && docker compose up -d`
-2. Create its `lake` catalog: `./scripts/create-catalog.sh` (or the two curls in
-   part 2's README Quickstart)
+## Quickstart
 
-Everything below then runs from *this* directory.
+```bash
+docker compose up -d
+```
+
+This brings up MinIO, Postgres, and the Gravitino catalog server, and — via two
+one-shot init services — automatically prepares Gravitino's own metadata schema
+(`schema-init`) and installs a SHA-pinned PyIceberg client (`pyiceberg-init`;
+see [Gotchas](#gotchas) for why this tour needs it at all).
+
+Wait for `catalog-dynamic` to report healthy:
+
+```bash
+docker compose ps catalog-dynamic
+```
+
+Then create the metalake and the `lake` catalog — the same two curls as part
+2's Quickstart, deliberately not automated by `docker compose up` for the same
+reason: seeing them run is the point.
+
+```bash
+./scripts/create-catalog.sh
+```
+
+Everything below then runs from *this* directory, against this part's own
+catalog. Host ports: 9000/9090 MinIO, 8090 Gravitino API, 9002 Iceberg REST —
+identical to part 2's, by design; the two stacks are otherwise entirely
+independent and share no volumes or state.
 
 Every command here creates and uses its own `tour` namespace and `events`
-table — separate from part 2's `demo` namespace — so running this tour, in any
-order, any number of times, never changes part 2's expected row counts or
-snapshot chain.
+table, so running this tour, in any order, any number of times, is always safe
+to rerun.
 
 ## The tour
 
@@ -85,11 +112,21 @@ curl http://localhost:9002/iceberg/v1/lake/namespaces/tour/tables/events \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["metadata-location"])'
 ```
 
-Run that, make a commit (`scripts/02-metadata-pointer-swap.sh` does this via
-DuckDB, since a from-scratch curl commit means constructing a full Iceberg
-metadata.json and manifest by hand), and run it again — `metadata-location`
-points at a different file. Each commit is a brand-new metadata.json; the swap
-is what makes a commit atomic and every prior state still readable.
+Run that, make a commit, and run it again — `metadata-location` points at a
+different file. Each commit is a brand-new metadata.json; the swap is what
+makes a commit atomic and every prior state still readable.
+
+The commit itself (`scripts/02-metadata-pointer-swap.sh` calls
+`scripts/commit-event.py`, run inside the `pyiceberg` container) is the one
+step in this tour that isn't plain curl, and deliberately so: a commit is a
+client-library operation. The client writes the actual data file and a new
+manifest first, then makes **one** atomic REST update call — the
+"requirements + updates" protocol from the blog post, here in its real,
+runnable form. A from-scratch curl commit would mean hand-building an Iceberg
+manifest and metadata.json by hand, which defeats the point of showing the
+protocol. PyIceberg is a REST-catalog Python client, not a query engine — see
+[Gotchas](#gotchas) for the one thing it needs that the blog post's own
+PyIceberg snippet doesn't set.
 
 ### 3. Credential vending
 
@@ -119,14 +156,38 @@ table prefix — not the static `minioadmin`/`minioadmin` root credentials the
 rig uses elsewhere. This is what lets an engine hand a client a table
 reference without ever handing it a long-lived key.
 
-### List both namespaces
+### List namespaces
 
 ```bash
 curl http://localhost:9002/iceberg/v1/lake/namespaces
 ```
 
-If you've already worked through part 2's engine sections, you'll see both
-`demo` and `tour` here. If you're doing part 1 in isolation right after the
-Quickstart, you'll see just `tour` — that's expected, and is itself the point:
-namespaces are scoped independently within a catalog, not a shared blob, and
-nothing this tour does can touch `demo`'s rows or snapshots.
+Always just `tour` — this part's catalog is entirely its own, not shared with
+part 2's stack at all.
+
+## Gotchas
+
+**PyIceberg needs `auth={"type": "noop"}` explicitly, or it 401s.** Without an
+explicit auth override, PyIceberg's REST client attaches a literal
+`Authorization: Bearer None` header (no token configured, stringified anyway),
+and Gravitino rejects it outright rather than treating it as no credentials at
+all. `scripts/commit-event.py` sets `auth={"type": "noop"}` on `load_catalog`
+to get a clean, unauthenticated connection — the PyIceberg equivalent of
+DuckDB's `AUTHORIZATION_TYPE 'none'` in part 2.
+
+**`event_id` needs an explicit non-nullable pyarrow schema.** The `events`
+table's `event_id` column is `required` (see `scripts/01-namespace-and-table.sh`).
+A plain `pa.table({...})` defaults every column to nullable, and PyIceberg's
+`append()` rejects the mismatch before writing anything. `commit-event.py`
+builds an explicit `pa.schema(...)` with `event_id` marked `nullable=False` to
+match.
+
+**Same host ports as part 2.** Both parts publish MinIO on 9000/9090, Gravitino
+on 8090, and the Iceberg REST endpoint on 9002. `docker compose down` one part
+before starting the other.
+
+## Teardown
+
+```bash
+docker compose down -v
+```

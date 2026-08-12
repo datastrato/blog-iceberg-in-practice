@@ -7,7 +7,9 @@ config file). Spark, Flink, Trino, and DuckDB all read and write the same
 
 > **This is a demo rig, not a reference deployment.** Single-node MinIO, a shared
 > Postgres instance for everything, no auth, no TLS, no HA. It's built to make
-> the REST Catalog's behavior visible, not to model a production topology.
+> the REST Catalog's behavior visible, not to model a production topology. Part
+> 1 is fully independent of this stack but uses the **same host ports** — bring
+> one part down (`docker compose down`) before starting the other.
 
 ## Prerequisites
 

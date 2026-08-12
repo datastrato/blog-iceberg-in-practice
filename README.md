@@ -11,12 +11,20 @@ multi-engine usage. Read the series on [datastrato.ai](https://datastrato.ai/blo
 > auth, no TLS, no HA — built to make Iceberg's behavior visible, not to model
 > a production topology. Each part's README says so again, closer to the code.
 
+Each part is **self-contained**: its own `docker-compose.yml`, its own
+Gravitino/Postgres/MinIO, runnable from that part's directory alone in a fresh
+clone — no need to check out or start any other part first. The two parts do
+publish the same host ports (by design, so the stacks stay identical in shape),
+so bring one down before starting the other; see each part's own README for
+the exact port list.
+
 ## Contents
 
 - **[`part-1-rest-catalog/`](part-1-rest-catalog/)** — a curl-level tour of the
   Iceberg REST Catalog API: config discovery, creating a namespace and table,
   watching the metadata pointer swap across commits, and fetching vended
-  credentials. Runs against part 2's stack; no infrastructure of its own.
+  credentials. The one non-curl step (making an actual commit) runs through a
+  SHA-pinned PyIceberg client, not a query engine.
 - **[`part-2-one-table-many-engines/`](part-2-one-table-many-engines/)** — one
   Iceberg REST Catalog, four engines (Spark, Flink, Trino, DuckDB) reading and
   writing the same table, including a concurrency test with two engines
