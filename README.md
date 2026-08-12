@@ -5,7 +5,7 @@ well — starting from the REST Catalog spec itself and building up to real
 multi-engine usage. Read the series on [datastrato.ai](https://datastrato.ai/blog):
 
 - **Part 1: [The Iceberg REST Catalog, Actually Explained](https://datastrato.ai/blog/iceberg-rest-catalog-actually-explained)**
-- Part 2: one table, many engines — coming soon
+- **Part 2: [One Table, Many Engines](https://datastrato.ai/blog/one-table-many-engines)**
 
 > **These are demo rigs, not reference deployments.** Single-node storage, no
 > auth, no TLS, no HA — built to make Iceberg's behavior visible, not to model

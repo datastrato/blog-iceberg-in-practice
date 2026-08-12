@@ -106,8 +106,14 @@ either engine wrote anything.
 ./scripts/duckdb-sql.sh sql/04-duckdb-dynamic.sql
 ```
 
-Same 7,000 rows, same per-writer breakdown — see [Gotchas](#gotchas) for the two
-things that make this `ATTACH` easy to get wrong on the first try.
+Same 7,000 rows, same per-writer breakdown, read with **zero client-side S3
+credentials** — the `ATTACH` uses `ACCESS_DELEGATION_MODE 'vended_credentials'`,
+so the catalog hands DuckDB short-lived, table-scoped credentials at query
+time instead of a static key. See [Gotchas](#gotchas) for the details that
+make this `ATTACH` easy to get wrong on the first try.
+
+**Expected:** `flink-dynamic 2000 / spark-dynamic 5000`, total **7,000** rows,
+and `duckdb_secrets()` empty before the query runs.
 
 ## Concurrency test
 
@@ -171,10 +177,13 @@ here (an easy first guess) 404s.
 defaults a `TYPE ICEBERG` secret/attach to `oauth2` and refuses to proceed
 without credentials in that mode — even against a catalog with no auth at all,
 so `AUTHORIZATION_TYPE 'none'` has to be explicit (see `sql/04-duckdb-dynamic.sql`).
-Separately, if you experiment with `ACCESS_DELEGATION_MODE` to fetch vended
-credentials instead of using a static S3 secret, the enum value is
-`vended_credentials` with an **underscore** — `vended-credentials` (hyphen) is
-rejected outright, not silently ignored.
+That script also sets `ACCESS_DELEGATION_MODE 'vended_credentials'` so DuckDB
+fetches short-lived, table-scoped credentials from the catalog instead of
+needing a static S3 secret of its own — the enum value is `vended_credentials`
+with an **underscore**; `vended-credentials` (hyphen) is rejected outright, not
+silently ignored. If your catalog doesn't vend credentials (no
+`credential-providers` set on it), the script's commented-out block shows the
+static-secret fallback.
 
 ## Teardown
 
