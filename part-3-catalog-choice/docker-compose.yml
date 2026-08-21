@@ -1,0 +1,211 @@
+# Catalog choice: catalogs as API objects, a curl-level tour of dynamic
+# provisioning. A single Gravitino server, running in dynamic mode (same as
+# part 2), with no engines attached -- this tour only ever talks to the
+# management API and the embedded Iceberg REST service.
+#
+# The demo: create a catalog with a POST, prove it's live with no restart,
+# create a second one with its own backend database (two catalogs sharing one
+# DB alias each other's namespaces -- see part-3's README Gotchas), prove both
+# are isolated, then drop one the real way (disable, then drop) and prove the
+# other is untouched. Scripts 05-06 then register a catalog Gravitino never
+# created and serve it unchanged.
+#
+# Those last two scripts need a writer and a reader, which live in the
+# `federation` profile so that a plain `docker compose up -d` stays exactly as
+# engine-free as the curl tour it serves. The scripts bring them up themselves,
+# one-shot, via `docker compose --profile federation run --rm`.
+#
+# Host ports (same as parts 1 and 2 -- bring the other stack down first):
+#   9000 MinIO S3 API        9090 MinIO console
+#   8090 Gravitino API       9002 Iceberg REST (embedded/aux service)
+#   5432 Postgres
+#
+# `docker compose up -d` brings up MinIO and Postgres and prepares Gravitino's
+# own metadata schema (schema-init) automatically. Creating the metalake and
+# every catalog after it is deliberately NOT automated -- that's the point of
+# this tour, see scripts/.
+
+name: iceberg-in-practice-part3
+
+x-s3-env: &s3-env
+  AWS_ACCESS_KEY_ID: minioadmin
+  AWS_SECRET_ACCESS_KEY: minioadmin
+  AWS_REGION: us-east-1
+
+services:
+
+  # ---------- storage ----------
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9090"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9090:9090"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    volumes:
+      - minio-data:/data
+
+  # Creates the lakehouse bucket, then exits.
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadmin &&
+      mc mb --ignore-existing local/lakehouse &&
+      mc ls local &&
+      echo 'bucket ready'
+      "
+
+  # ---------- catalog backend ----------
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: iceberg
+      POSTGRES_PASSWORD: iceberg
+      POSTGRES_DB: iceberg
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U iceberg -d iceberg"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+
+  # Only creates gravitino_meta (Gravitino's own entity store) and loads its
+  # schema. Unlike part 2's schema-init, this does NOT pre-create a shared
+  # catalog-backend database -- every catalog in this tour gets its own,
+  # created live by the numbered scripts, because that's the teaching point.
+  schema-init:
+    image: postgres:16
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./conf/gravitino-meta-schema-1.3.0-postgresql.sql:/schema.sql:ro
+    environment:
+      PGPASSWORD: iceberg
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -euo pipefail
+        psql -h postgres -U iceberg -d iceberg -tc \
+          "SELECT 1 FROM pg_database WHERE datname = 'gravitino_meta'" | grep -q 1 \
+          || psql -h postgres -U iceberg -d iceberg -c "CREATE DATABASE gravitino_meta"
+        psql -h postgres -U iceberg -d gravitino_meta -f /schema.sql
+        echo "schema-init complete"
+
+  # Full Gravitino server with the Iceberg REST service enabled as an
+  # auxiliary/embedded service and the dynamic catalog-config provider:
+  # catalogs are created via POST to the management API (port 8090) and the
+  # embedded IRC (port 9001 in-container, published as 9002) reads each
+  # catalog's config from Gravitino's own registry on every request.
+  catalog-dynamic:
+    image: apache/gravitino:1.3.0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      schema-init:
+        condition: service_completed_successfully
+    ports:
+      - "8090:8090"    # Gravitino management API -- every catalog POST/PATCH/
+                        # DELETE in this tour goes here.
+      - "9002:9001"     # embedded Iceberg REST; container port is still 9001.
+    environment:
+      # The image's entrypoint rewrites conf/gravitino.conf from env vars on
+      # every boot, os.remove()-ing the file first -- which can't work on a
+      # bind mount. This undocumented flag turns that rewrite off.
+      SKIP_CONFIG_REWRITE: "true"
+    volumes:
+      - ./conf/gravitino.conf:/opt/gravitino/conf/gravitino.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8090/api/version || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  # ---------- federation profile: the seeder and the reader (scripts 05-06) ----------
+
+  # Installs the SHA-pinned PyIceberg used by the seeder, then exits.
+  pyiceberg-init:
+    profiles: ["federation"]
+    image: python:3.12-slim
+    volumes:
+      - ./requirements/pyiceberg.txt:/requirements.txt:ro
+      - pyiceberg-site-packages:/out
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -euo pipefail
+        # Same "already present, leave it alone" rule as scripts/fetch-jars.py:
+        # this service is a dependency of a one-shot `run`, so it is re-entered
+        # every time script 05 runs.
+        if [ -d /out/pyiceberg ]; then
+          echo "pyiceberg already installed, skipping"
+          exit 0
+        fi
+        pip install --root-user-action=ignore --require-hashes --target=/out -r /requirements.txt
+
+  # The "catalog you already run" writer: PyIceberg's SqlCatalog straight to
+  # Postgres over JDBC. Deliberately has no Gravitino configuration at all.
+  pyiceberg:
+    profiles: ["federation"]
+    image: python:3.12-slim
+    depends_on:
+      postgres:
+        condition: service_healthy
+      pyiceberg-init:
+        condition: service_completed_successfully
+    environment:
+      <<: *s3-env
+      PYTHONPATH: /opt/pyiceberg-site-packages
+    volumes:
+      - pyiceberg-site-packages:/opt/pyiceberg-site-packages:ro
+      - ./scripts:/scripts:ro
+
+  # Fetches the pinned DuckDB CLI, then exits.
+  jars-init:
+    profiles: ["federation"]
+    image: python:3.12-alpine
+    volumes:
+      - ./scripts/fetch-jars.py:/fetch-jars.py:ro
+      - jars-duckdb:/out/duckdb
+    command: ["python3", "/fetch-jars.py"]
+
+  # The reader that didn't write anything: DuckDB over the Iceberg REST
+  # endpoint. Runs on the compose network, not the host, because table metadata
+  # resolves s3://lakehouse/... via minio:9000.
+  duckdb:
+    profiles: ["federation"]
+    image: debian:bookworm-slim
+    depends_on:
+      catalog-dynamic:
+        condition: service_healthy
+      jars-init:
+        condition: service_completed_successfully
+    environment: *s3-env
+    volumes:
+      - jars-duckdb:/opt/duckdb:ro
+      - ./sql:/sql:ro
+      - duckdb-ext:/root/.duckdb
+
+volumes:
+  minio-data:
+  pg-data:
+  pyiceberg-site-packages:
+  jars-duckdb:
+  duckdb-ext:

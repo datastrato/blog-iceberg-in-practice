@@ -6,6 +6,8 @@ multi-engine usage. Read the series on [datastrato.ai](https://datastrato.ai/blo
 
 - **Part 1: [The Iceberg REST Catalog, Actually Explained](https://datastrato.ai/blog/iceberg-rest-catalog-actually-explained)**
 - **Part 2: [One Table, Many Engines](https://datastrato.ai/blog/one-table-many-engines)**
+- **Part 3: Catalog Choice: The Decision That Outlives Your Engines** (post
+  link added when it publishes)
 
 > **These are demo rigs, not reference deployments.** Single-node storage, no
 > auth, no TLS, no HA — built to make Iceberg's behavior visible, not to model
@@ -13,7 +15,7 @@ multi-engine usage. Read the series on [datastrato.ai](https://datastrato.ai/blo
 
 Each part is **self-contained**: its own `docker-compose.yml`, its own
 Gravitino/Postgres/MinIO, runnable from that part's directory alone in a fresh
-clone — no need to check out or start any other part first. The two parts do
+clone — no need to check out or start any other part first. The parts do
 publish the same host ports (by design, so the stacks stay identical in shape),
 so bring one down before starting the other; see each part's own README for
 the exact port list.
@@ -29,6 +31,12 @@ the exact port list.
   Iceberg REST Catalog, four engines (Spark, Flink, Trino, DuckDB) reading and
   writing the same table, including a concurrency test with two engines
   committing at once.
+- **[`part-3-catalog-choice/`](part-3-catalog-choice/)** — a curl-level tour of
+  catalogs as API objects: creating and dropping catalogs through Gravitino's
+  management API with no restart, proving a drop de-registers without
+  destroying data, and registering a pre-existing Iceberg JDBC catalog that
+  Gravitino never created, then reading its rows back through the Iceberg REST
+  endpoint with DuckDB.
 
 ## License
 
